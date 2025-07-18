@@ -118,6 +118,19 @@ def fix_agent_position(s_row, s_col, height, width, grid, free_cells):
 def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints, height, width):
     """
     Process a single .scen file, adding waypoints to each agent line.
+    Legacy function for backwards compatibility.
+    Returns number of agents processed.
+    """
+    output_paths = {n_waypoints: output_path}
+    waypoint_counts = [n_waypoints]
+    return process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width)
+
+
+def process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width):
+    """
+    Process a single .scen file, generating multiple output files with hierarchical waypoints.
+    output_paths: dict mapping waypoint count to output path
+    waypoint_counts: list of waypoint counts (e.g., [2, 4, 8])
     Returns number of agents processed.
     """
     try:
@@ -128,12 +141,13 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
         return 0
     
     if not lines:
-        # Empty file, create empty output
-        with open(output_path, 'w') as f:
-            pass
+        # Empty file, create empty outputs
+        for output_path in output_paths.values():
+            with open(output_path, 'w') as f:
+                pass
         return 0
     
-    output_lines = []
+    max_waypoints = max(waypoint_counts)
     agents_processed = 0
     agents_fixed = 0
     
@@ -143,7 +157,6 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
     if lines and (lines[0].startswith('version') or lines[0].startswith('Version')):
         header_line = lines[0]
         start_idx = 1
-        output_lines.append(header_line)
     
     # First pass: collect all agents and their reachable cells
     agent_data = []
@@ -180,8 +193,8 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
             reachable = bfs_reachable(grid, (fixed_row, fixed_col))
             reachable_cells = [(r, c) for (r, c) in free_cells if (r, c) in reachable]
             
-            if len(reachable_cells) < n_waypoints:
-                print(f"  Warning: Agent {i} has only {len(reachable_cells)} reachable cells, need {n_waypoints}")
+            if len(reachable_cells) < max_waypoints:
+                print(f"  Warning: Agent {i} has only {len(reachable_cells)} reachable cells, need {max_waypoints}")
             
             agent_data.append({
                 'line_num': i,
@@ -199,16 +212,16 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
                 'original_line': line
             })
     
-    # Second pass: assign unique waypoints to each agent
+    # Second pass: assign hierarchical waypoints to each agent
+    # Generate waypoints for max_waypoints, then subset for smaller counts
+    all_agent_waypoints = {}  # Maps agent line number to list of waypoints
+    
     for i, line in enumerate(lines[start_idx:], start_idx + 1):
         if not line.strip():
-            output_lines.append(line)
             continue
             
         fields = line.split('\t')
         if len(fields) != 9:
-            # Not a standard agent line, copy as-is
-            output_lines.append(line)
             continue
         
         # Find corresponding agent data
@@ -219,7 +232,6 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
                 break
         
         if not agent_info or agent_info['fields'] is None:
-            output_lines.append(line)  # Copy as-is
             continue
         
         fields = agent_info['fields']
@@ -228,38 +240,80 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
         # Find available waypoints (reachable cells not already used)
         available_cells = [cell for cell in reachable_cells if cell not in used_waypoints]
         
-        if len(available_cells) < n_waypoints:
-            if len(reachable_cells) < n_waypoints:
+        if len(available_cells) < max_waypoints:
+            if len(reachable_cells) < max_waypoints:
                 # Use all available reachable cells
                 waypoint_cells = available_cells
             else:
                 # If we have enough reachable cells but many are used, allow some overlap
-                waypoint_cells = random.sample(reachable_cells, n_waypoints)
+                waypoint_cells = random.sample(reachable_cells, max_waypoints)
         else:
             # Sample from available cells
-            waypoint_cells = random.sample(available_cells, n_waypoints)
+            waypoint_cells = random.sample(available_cells, max_waypoints)
         
         # Mark these waypoints as used
         for cell in waypoint_cells:
             used_waypoints.add(cell)
         
-        # Build the output line
-        tail = [str(len(waypoint_cells))]
-        for r, c in waypoint_cells:
-            tail.extend([str(c), str(r)])  # x-coordinate (column), y-coordinate (row)
-        
-        output_line = '\t'.join(fields + tail)
-        output_lines.append(output_line)
+        all_agent_waypoints[i] = waypoint_cells
         agents_processed += 1
     
-    # Write output
-    try:
-        with open(output_path, 'w') as f:
-            for line in output_lines:
-                f.write(line + '\n')
-    except Exception as e:
-        print(f"Warning: Could not write {output_path}: {e}")
-        return 0
+    # Generate output files for each waypoint count
+    for n_waypoints in waypoint_counts:
+        output_lines = []
+        
+        # Add header if present
+        if header_line:
+            output_lines.append(header_line)
+        
+        # Process each line
+        for i, line in enumerate(lines[start_idx:], start_idx + 1):
+            if not line.strip():
+                output_lines.append(line)
+                continue
+                
+            fields = line.split('\t')
+            if len(fields) != 9:
+                # Not a standard agent line, copy as-is
+                output_lines.append(line)
+                continue
+            
+            # Find corresponding agent data
+            agent_info = None
+            for agent in agent_data:
+                if agent['line_num'] == i:
+                    agent_info = agent
+                    break
+            
+            if not agent_info or agent_info['fields'] is None:
+                output_lines.append(line)  # Copy as-is
+                continue
+            
+            fields = agent_info['fields']
+            
+            # Get hierarchical waypoints (first n_waypoints from the max set)
+            if i in all_agent_waypoints:
+                waypoint_cells = all_agent_waypoints[i][:n_waypoints]
+            else:
+                waypoint_cells = []
+            
+            # Build the output line
+            tail = [str(len(waypoint_cells))]
+            for r, c in waypoint_cells:
+                tail.extend([str(c), str(r)])  # x-coordinate (column), y-coordinate (row)
+            
+            output_line = '\t'.join(fields + tail)
+            output_lines.append(output_line)
+        
+        # Write output for this waypoint count
+        output_path = output_paths[n_waypoints]
+        try:
+            with open(output_path, 'w') as f:
+                for line in output_lines:
+                    f.write(line + '\n')
+        except Exception as e:
+            print(f"Warning: Could not write {output_path}: {e}")
+            return 0
     
     if agents_fixed > 0:
         print(f"  -> Processed {agents_processed} agents, fixed {agents_fixed} invalid positions")
@@ -274,13 +328,23 @@ def main():
     parser.add_argument('--maps', required=True, help='Directory containing .map files')
     parser.add_argument('--src', required=True, help='Root directory of original scenario folders')
     parser.add_argument('--dst', required=True, help='Root directory for new waypoint scenarios')
-    parser.add_argument('--n', type=int, required=True, help='Number of waypoints per agent')
+    parser.add_argument('--n', type=int, help='Number of waypoints per agent (legacy mode, generates only one file)')
     parser.add_argument('--seed', type=int, default=0, help='Random seed (default: 0)')
     
     args = parser.parse_args()
     
     # Set random seed
     random.seed(args.seed)
+    
+    # Determine mode: legacy (single file) or new (multiple files)
+    if args.n is not None:
+        # Legacy mode: single waypoint count
+        waypoint_counts = [args.n]
+        print(f"Running in legacy mode with {args.n} waypoints")
+    else:
+        # New mode: multiple waypoint counts
+        waypoint_counts = [2, 4, 8]
+        print(f"Running in multi-file mode with waypoint counts: {waypoint_counts}")
     
     # Validate directories
     maps_dir = Path(args.maps)
@@ -326,26 +390,47 @@ def main():
         
         height, width, free_cells, grid = maps[map_name]
         
-        if len(free_cells) < args.n:
-            print(f"Error: Map {map_name} has only {len(free_cells)} free cells, need {args.n}")
+        max_waypoints = max(waypoint_counts)
+        if len(free_cells) < max_waypoints:
+            print(f"Error: Map {map_name} has only {len(free_cells)} free cells, need {max_waypoints}")
             return 1
         
-        # Create destination subdirectory
-        dst_subdir = dst_dir / map_name
-        dst_subdir.mkdir(exist_ok=True)
+        # Create destination subdirectories
+        dst_subdirs = {}
+        if args.n is not None:
+            # Legacy mode: use original directory structure
+            dst_subdir = dst_dir / map_name
+            dst_subdir.mkdir(exist_ok=True)
+            dst_subdirs[args.n] = dst_subdir
+        else:
+            # New mode: create separate directories for each waypoint count
+            for n_waypoints in waypoint_counts:
+                dst_subdir = dst_dir / f"{map_name}_{n_waypoints}wp"
+                dst_subdir.mkdir(exist_ok=True)
+                dst_subdirs[n_waypoints] = dst_subdir
         
         # Process all .scen files in this subdirectory
         for scen_file in src_subdir.glob('*.scen'):
-            output_file = dst_subdir / scen_file.name
-            print(f"Processing {scen_file.name}...")
+            # Create output paths for each waypoint count
+            output_paths = {}
+            for n_waypoints in waypoint_counts:
+                output_paths[n_waypoints] = dst_subdirs[n_waypoints] / scen_file.name
             
-            agents = process_scenario_file(scen_file, output_file, free_cells, grid, args.n, height, width)
+            if args.n is not None:
+                print(f"Processing {scen_file.name} with {args.n} waypoints...")
+            else:
+                print(f"Processing {scen_file.name} for {waypoint_counts} waypoints...")
+            
+            agents = process_scenario_file_multiple(scen_file, output_paths, free_cells, grid, waypoint_counts, height, width)
             total_agents += agents
-            total_files += 1
+            if args.n is not None:
+                total_files += 1  # Legacy mode: one file per scenario
+            else:
+                total_files += len(waypoint_counts)  # New mode: multiple files per scenario
     
     print(f"\nGenerated {total_files} waypoint files.")
     print(f"Total agents processed: {total_agents}.")
-    print(f"Waypoints per agent: {args.n}.")
+    print(f"Waypoint configurations: {waypoint_counts}.")
     
     return 0
 
