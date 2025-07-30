@@ -343,7 +343,7 @@ def main():
         print(f"Running in legacy mode with {args.n} waypoints")
     else:
         # New mode: multiple waypoint counts
-        waypoint_counts = [2, 4, 8]
+        waypoint_counts = [0, 1, 2, 4, 8]
         print(f"Running in multi-file mode with waypoint counts: {waypoint_counts}")
     
     # Validate directories
