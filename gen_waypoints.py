@@ -123,10 +123,10 @@ def process_scenario_file(scen_path, output_path, free_cells, grid, n_waypoints,
     """
     output_paths = {n_waypoints: output_path}
     waypoint_counts = [n_waypoints]
-    return process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width)
+    return process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width, seed=0)
 
 
-def process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width):
+def process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, waypoint_counts, height, width, seed=0):
     """
     Process a single .scen file, generating multiple output files with hierarchical waypoints.
     output_paths: dict mapping waypoint count to output path
@@ -160,151 +160,189 @@ def process_scenario_file_multiple(scen_path, output_paths, free_cells, grid, wa
     
     # First pass: collect all agents and their reachable cells
     agent_data = []
-    used_waypoints = set()  # Track globally used waypoints
-    
+
     for i, line in enumerate(lines[start_idx:], start_idx + 1):
         if not line.strip():
             continue
-            
+
         fields = line.split('\t')
         if len(fields) != 9:
             continue
-        
+
         try:
             # Parse agent coordinates (field 4 = x-coordinate/column, field 5 = y-coordinate/row)
             s_col = int(fields[4])  # start x-coordinate (column)
             s_row = int(fields[5])  # start y-coordinate (row)
-            
+
             # Fix agent position if necessary
             fixed_row, fixed_col, was_fixed = fix_agent_position(s_row, s_col, height, width, grid, free_cells)
-            
+
             if was_fixed:
                 agents_fixed += 1
                 if s_row < 0 or s_row >= height or s_col < 0 or s_col >= width:
                     print(f"  Fixed out-of-bounds agent {i}: ({s_col},{s_row}) -> ({fixed_col},{fixed_row})")
                 else:
                     print(f"  Fixed agent {i} on obstacle: ({s_col},{s_row}) -> ({fixed_col},{fixed_row})")
-                
+
                 # Update the fields with fixed coordinates
                 fields[4] = str(fixed_col)  # x-coordinate
                 fields[5] = str(fixed_row)  # y-coordinate
-            
+
             # Find reachable cells from the (possibly fixed) start position
             reachable = bfs_reachable(grid, (fixed_row, fixed_col))
             reachable_cells = [(r, c) for (r, c) in free_cells if (r, c) in reachable]
-            
+
             if len(reachable_cells) < max_waypoints:
                 print(f"  Warning: Agent {i} has only {len(reachable_cells)} reachable cells, need {max_waypoints}")
-            
+
             agent_data.append({
                 'line_num': i,
                 'fields': fields,
                 'reachable_cells': reachable_cells,
-                'original_line': line
+                'original_line': line,
+                'agent_id': i  # Add agent ID for seeding
             })
-            
+
         except (ValueError, IndexError) as e:
             print(f"  Warning: Could not parse agent {i}: {e}")
             agent_data.append({
                 'line_num': i,
                 'fields': None,
                 'reachable_cells': [],
-                'original_line': line
+                'original_line': line,
+                'agent_id': i
             })
-    
-    # Second pass: assign hierarchical waypoints to each agent
-    # Generate waypoints for max_waypoints, then subset for smaller counts
+
+    agents_processed = len([a for a in agent_data if a['fields'] is not None])
+    max_waypoints = max(waypoint_counts)
+
+    # Second pass: generate hierarchical waypoints for max_waypoints, then subset for each count
     all_agent_waypoints = {}  # Maps agent line number to list of waypoints
-    
-    for i, line in enumerate(lines[start_idx:], start_idx + 1):
-        if not line.strip():
+
+    for agent_info in agent_data:
+        if agent_info['fields'] is None:
             continue
-            
-        fields = line.split('\t')
-        if len(fields) != 9:
-            continue
-        
-        # Find corresponding agent data
-        agent_info = None
-        for agent in agent_data:
-            if agent['line_num'] == i:
-                agent_info = agent
-                break
-        
-        if not agent_info or agent_info['fields'] is None:
-            continue
-        
-        fields = agent_info['fields']
+
+        i = agent_info['line_num']
         reachable_cells = agent_info['reachable_cells']
-        
-        # Find available waypoints (reachable cells not already used)
-        available_cells = [cell for cell in reachable_cells if cell not in used_waypoints]
-        
-        if len(available_cells) < max_waypoints:
-            if len(reachable_cells) < max_waypoints:
-                # Use all available reachable cells
-                waypoint_cells = available_cells
+
+        # Generate waypoints for this agent using agent-specific seeding
+        waypoint_cells = []
+        if max_waypoints > 0 and len(reachable_cells) > 0:
+            # Create agent-specific random generator for hierarchical consistency
+            agent_seed = hash((seed, agent_info['agent_id'], scen_path))
+            agent_rng = random.Random(agent_seed)
+
+            if len(reachable_cells) >= max_waypoints:
+                # Sample from reachable cells
+                waypoint_cells = agent_rng.sample(reachable_cells, max_waypoints)
             else:
-                # If we have enough reachable cells but many are used, allow some overlap
-                waypoint_cells = random.sample(reachable_cells, max_waypoints)
-        else:
-            # Sample from available cells
-            waypoint_cells = random.sample(available_cells, max_waypoints)
-        
-        # Mark these waypoints as used
-        for cell in waypoint_cells:
-            used_waypoints.add(cell)
-        
+                # Use all available reachable cells
+                waypoint_cells = reachable_cells[:max_waypoints]
+
         all_agent_waypoints[i] = waypoint_cells
-        agents_processed += 1
-    
+
+    # Generate waypoint assignments with per-position uniqueness and hierarchical consistency
+    global_assignments = {}  # Maps (agent_id, n_waypoints) -> list of waypoints
+
+    # Process each waypoint position to ensure uniqueness within each position
+    max_waypoints = max(waypoint_counts) if waypoint_counts else 0
+
+    # For each waypoint position, resolve conflicts
+    for pos in range(max_waypoints):
+        used_at_position = set()
+
+        # Sort agents by conflict potential at this position (deterministic order)
+        agents_at_position = []
+        for agent_info in agent_data:
+            if agent_info['fields'] is None:
+                continue
+            i = agent_info['line_num']
+            if i in all_agent_waypoints and pos < len(all_agent_waypoints[i]):
+                agents_at_position.append((i, agent_info))
+
+        # Process agents in deterministic order (by agent line number)
+        agents_at_position.sort(key=lambda x: x[0])
+
+        for i, agent_info in agents_at_position:
+            hierarchical_waypoint = all_agent_waypoints[i][pos]
+            reachable_cells = agent_info['reachable_cells']
+
+            if hierarchical_waypoint not in used_at_position:
+                # Can use the hierarchical waypoint
+                final_waypoint = hierarchical_waypoint
+            else:
+                # Need alternative - find one that's not used at this position
+                agent_seed = hash((seed, agent_info['agent_id'], scen_path, pos))
+                agent_rng = random.Random(agent_seed)
+
+                available = [cell for cell in reachable_cells if cell not in used_at_position]
+                if available:
+                    agent_rng.shuffle(available)
+                    final_waypoint = available[0]
+                else:
+                    # If no alternatives, keep the hierarchical waypoint (rare case)
+                    final_waypoint = hierarchical_waypoint
+
+            # Update the waypoint at this position
+            all_agent_waypoints[i][pos] = final_waypoint
+            used_at_position.add(final_waypoint)
+
+    # Now generate output files with simple hierarchical slicing
+    for n_waypoints in waypoint_counts:
+        for agent_info in agent_data:
+            if agent_info['fields'] is not None:
+                i = agent_info['line_num']
+                if i in all_agent_waypoints:
+                    waypoints = all_agent_waypoints[i][:n_waypoints]
+                else:
+                    waypoints = []
+                global_assignments[(i, n_waypoints)] = waypoints
+
     # Generate output files for each waypoint count
     for n_waypoints in waypoint_counts:
         output_lines = []
-        
+
         # Add header if present
         if header_line:
             output_lines.append(header_line)
-        
-        # Process each line
+
+        # Process each line to generate output
         for i, line in enumerate(lines[start_idx:], start_idx + 1):
             if not line.strip():
                 output_lines.append(line)
                 continue
-                
+
             fields = line.split('\t')
             if len(fields) != 9:
                 # Not a standard agent line, copy as-is
                 output_lines.append(line)
                 continue
-            
+
             # Find corresponding agent data
             agent_info = None
             for agent in agent_data:
                 if agent['line_num'] == i:
                     agent_info = agent
                     break
-            
+
             if not agent_info or agent_info['fields'] is None:
                 output_lines.append(line)  # Copy as-is
                 continue
-            
+
             fields = agent_info['fields']
-            
-            # Get hierarchical waypoints (first n_waypoints from the max set)
-            if i in all_agent_waypoints:
-                waypoint_cells = all_agent_waypoints[i][:n_waypoints]
-            else:
-                waypoint_cells = []
-            
+
+            # Get final waypoint assignment for this agent and waypoint count
+            waypoint_cells = global_assignments.get((i, n_waypoints), [])
+
             # Build the output line
             tail = [str(len(waypoint_cells))]
             for r, c in waypoint_cells:
                 tail.extend([str(c), str(r)])  # x-coordinate (column), y-coordinate (row)
-            
+
             output_line = '\t'.join(fields + tail)
             output_lines.append(output_line)
-        
+
         # Write output for this waypoint count
         output_path = output_paths[n_waypoints]
         try:
@@ -421,7 +459,7 @@ def main():
             else:
                 print(f"Processing {scen_file.name} for {waypoint_counts} waypoints...")
             
-            agents = process_scenario_file_multiple(scen_file, output_paths, free_cells, grid, waypoint_counts, height, width)
+            agents = process_scenario_file_multiple(scen_file, output_paths, free_cells, grid, waypoint_counts, height, width, args.seed)
             total_agents += agents
             if args.n is not None:
                 total_files += 1  # Legacy mode: one file per scenario
